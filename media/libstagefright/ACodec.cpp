@@ -55,6 +55,8 @@
 #include "include/DataConverter.h"
 #include "omx/OMXUtils.h"
 
+#include <stagefright/AVExtensions.h>
+
 namespace android {
 
 enum {
@@ -549,6 +551,10 @@ ACodec::ACodec()
 ACodec::~ACodec() {
 }
 
+status_t ACodec::setupCustomCodec(status_t err, const char *, const sp<AMessage> &) {
+    return err;
+}
+
 void ACodec::setNotificationMessage(const sp<AMessage> &msg) {
     mNotify = msg;
 }
@@ -984,7 +990,7 @@ status_t ACodec::setupNativeWindowSizeFormatAndUsage(
     mLastNativeWindowDataSpace = HAL_DATASPACE_UNKNOWN;
 
     ALOGV("gralloc usage: %#x(OMX) => %#x(ACodec)", omxUsage, usage);
-    return setNativeWindowSizeFormatAndUsage(
+    err = setNativeWindowSizeFormatAndUsage(
             nativeWindow,
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
@@ -992,6 +998,24 @@ status_t ACodec::setupNativeWindowSizeFormatAndUsage(
             mRotationDegrees,
             usage,
             reconnect);
+    if (err == OK) {
+        OMX_CONFIG_RECTTYPE rect;
+        InitOMXParams(&rect);
+        rect.nPortIndex = kPortIndexOutput;
+        err = mOMX->getConfig(
+                mNode, OMX_IndexConfigCommonOutputCrop, &rect, sizeof(rect));
+        if (err == OK) {
+            ALOGV("rect size = %d, %d, %d, %d", rect.nLeft, rect.nTop, rect.nWidth, rect.nHeight);
+            android_native_rect_t crop;
+            crop.left = rect.nLeft;
+            crop.top = rect.nTop;
+            crop.right = rect.nLeft + rect.nWidth - 1;
+            crop.bottom = rect.nTop + rect.nHeight - 1;
+            ALOGV("crop update (%d, %d), (%d, %d)", crop.left, crop.top, crop.right, crop.bottom);
+            err = native_window_set_crop(nativeWindow, &crop);
+        }
+    }
+    return err;
 }
 
 status_t ACodec::configureOutputBuffersFromNativeWindow(
@@ -2189,7 +2213,12 @@ status_t ACodec::configureCodec(
             }
             err = setupG711Codec(encoder, sampleRate, numChannels);
         }
+#ifdef QTI_FLAC_DECODER
+//setup qti flac component only if it is enabled and it is not encoder
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_FLAC) && encoder) {
+#else
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_FLAC)) {
+#endif
         int32_t numChannels = 0, sampleRate = 0, compressionLevel = -1;
         if (encoder &&
                 (!msg->findInt32("channel-count", &numChannels)
@@ -2245,6 +2274,8 @@ status_t ACodec::configureCodec(
         } else {
             err = setupEAC3Codec(encoder, numChannels, sampleRate);
         }
+    } else {
+        err = setupCustomCodec(err, mime, msg);
     }
 
     if (err != OK) {
@@ -2460,6 +2491,82 @@ status_t ACodec::setIntraRefreshPeriod(uint32_t intraRefreshPeriod, bool inConfi
     }
 
     return OK;
+}
+
+status_t ACodec::configureTemporalLayers(
+        uint32_t numLayers, uint32_t numBLayers, bool inConfigure,
+        sp<AMessage> &outputFormat) {
+    if (!mIsVideo || !mIsEncoder) {
+        return INVALID_OPERATION;
+    }
+
+    OMX_VIDEO_PARAM_ANDROID_TEMPORALLAYERINGTYPE layerParams;
+    InitOMXParams(&layerParams);
+    layerParams.nPortIndex = kPortIndexOutput;
+    status_t err = mOMX->getParameter(
+            mNode, (OMX_INDEXTYPE)OMX_IndexParamAndroidVideoTemporalLayering,
+            &layerParams, sizeof(layerParams));
+
+    if (err != OK) {
+        return err;
+    }
+
+    if (numLayers > layerParams.nLayerCountMax ||
+            numBLayers > layerParams.nBLayerCountMax) {
+        ALOGE("Requested temporal layer count (total=%u B=%u) exceeds max (total=%d B=%d)",
+            numLayers, numBLayers, layerParams.nLayerCountMax,
+            layerParams.nBLayerCountMax);
+        return ERROR_UNSUPPORTED;
+    }
+
+    if (!inConfigure) {
+        OMX_VIDEO_CONFIG_ANDROID_TEMPORALLAYERINGTYPE layerConfig;
+        InitOMXParams(&layerConfig);
+        layerConfig.nPLayerCountActual = numLayers - numBLayers;
+        layerConfig.nBLayerCountActual = numBLayers;
+        layerConfig.bBitrateRatiosSpecified = OMX_FALSE;
+        layerConfig.nPortIndex = kPortIndexOutput;
+        layerConfig.ePattern = OMX_VIDEO_AndroidTemporalLayeringPatternAndroid;
+        err = mOMX->setConfig(
+                mNode, (OMX_INDEXTYPE)OMX_IndexConfigAndroidVideoTemporalLayering,
+                &layerConfig, sizeof(layerConfig));
+        return err;
+    }
+
+    layerParams.nPLayerCountActual = numLayers - numBLayers;
+    layerParams.nBLayerCountActual = numBLayers;
+    layerParams.bBitrateRatiosSpecified = OMX_FALSE;
+    layerParams.ePattern = OMX_VIDEO_AndroidTemporalLayeringPatternAndroid;
+    err = mOMX->setParameter(
+            mNode, (OMX_INDEXTYPE)OMX_IndexParamAndroidVideoTemporalLayering,
+            &layerParams, sizeof(layerParams));
+
+    if (err != OK) {
+        return err;
+    }
+
+    err = mOMX->getParameter(
+            mNode, (OMX_INDEXTYPE)OMX_IndexParamAndroidVideoTemporalLayering,
+            &layerParams, sizeof(layerParams));
+
+    if (err != OK) {
+        return err;
+    }
+
+    ALOGI("Temporal layers requested (total=%u B=%u) v/s configured (total=%u B=%u)",
+            numLayers, numBLayers, layerParams.nPLayerCountActual,
+            layerParams.nBLayerCountActual);
+
+#if 0
+    mOutputFormat = mOutputFormat->dup();
+    mOutputFormat->setInt32("num-temporal-layers",
+            layerParams.nPLayerCountActual + layerParams.nBLayerCountActual);
+    mOutputFormat->setInt32("num-temporal-b-layers", layerParams.nBLayerCountActual);
+#endif
+    outputFormat->setInt32("num-temporal-layers",
+            layerParams.nPLayerCountActual + layerParams.nBLayerCountActual);
+
+    return err;
 }
 
 status_t ACodec::setMinBufferSize(OMX_U32 portIndex, size_t size) {
@@ -2915,6 +3022,10 @@ status_t ACodec::setupRawAudioFormat(
             pcmParams.eNumData = OMX_NumericalDataSigned;
             pcmParams.nBitPerSample = 16;
             break;
+        case kAudioEncodingPcm24bitPacked:
+            pcmParams.eNumData = OMX_NumericalDataSigned;
+            pcmParams.nBitPerSample = 24;
+            break;
         default:
             return BAD_VALUE;
     }
@@ -3107,6 +3218,7 @@ static const struct VideoCodingMapEntry {
     { MEDIA_MIMETYPE_VIDEO_AVC, OMX_VIDEO_CodingAVC },
     { MEDIA_MIMETYPE_VIDEO_HEVC, OMX_VIDEO_CodingHEVC },
     { MEDIA_MIMETYPE_VIDEO_MPEG4, OMX_VIDEO_CodingMPEG4 },
+    { MEDIA_MIMETYPE_VIDEO_MPEG4_DP, OMX_VIDEO_CodingMPEG4 },
     { MEDIA_MIMETYPE_VIDEO_H263, OMX_VIDEO_CodingH263 },
     { MEDIA_MIMETYPE_VIDEO_MPEG2, OMX_VIDEO_CodingMPEG2 },
     { MEDIA_MIMETYPE_VIDEO_VP8, OMX_VIDEO_CodingVP8 },
@@ -3114,7 +3226,7 @@ static const struct VideoCodingMapEntry {
     { MEDIA_MIMETYPE_VIDEO_DOLBY_VISION, OMX_VIDEO_CodingDolbyVision },
 };
 
-static status_t GetVideoCodingTypeFromMime(
+status_t ACodec::GetVideoCodingTypeFromMime(
         const char *mime, OMX_VIDEO_CODINGTYPE *codingType) {
     for (size_t i = 0;
          i < sizeof(kVideoCodingMapEntry) / sizeof(kVideoCodingMapEntry[0]);
@@ -3631,6 +3743,7 @@ status_t ACodec::setupVideoEncoder(
         if (!msg->findInt32("frame-rate", &tmp)) {
             return INVALID_OPERATION;
         }
+        outputFormat->setInt32("frame-rate", tmp);
         frameRate = (float)tmp;
         mTimePerFrameUs = (int64_t) (1000000.0f / frameRate);
     }
@@ -3751,6 +3864,21 @@ status_t ACodec::setupVideoEncoder(
     if (err == ERROR_UNSUPPORTED) { // support is optional
         ALOGI("[%s] cannot encode HDR static metadata. Ignoring.", mComponentName.c_str());
         err = OK;
+    }
+
+    if (compressionFormat == OMX_VIDEO_CodingAVC ||
+            compressionFormat == OMX_VIDEO_CodingHEVC) {
+        int32_t numLayers = 0;
+        int32_t numBLayers = 0;
+        if (msg->findInt32("num-temporal-layers", &numLayers)) {
+            msg->findInt32("num-temporal-b-layers", &numBLayers);
+            err = configureTemporalLayers(numLayers, numBLayers, true, outputFormat);
+            if (err != OK) {
+                ALOGE("Configuring temporal layers (P=%d B=%d) failed: %d",
+                        numLayers, numBLayers, err);
+                // not a fatal error
+            }
+        }
     }
 
     if (err == OK) {
@@ -3881,6 +4009,7 @@ status_t ACodec::setupMPEG4EncoderParameters(const sp<AMessage> &msg) {
         mpeg4type.eLevel = static_cast<OMX_VIDEO_MPEG4LEVELTYPE>(level);
     }
 
+    setBFrames(&mpeg4type);
     err = mOMX->setParameter(
             mNode, OMX_IndexParamVideoMpeg4, &mpeg4type, sizeof(mpeg4type));
 
@@ -4078,15 +4207,20 @@ status_t ACodec::setupAVCEncoderParameters(const sp<AMessage> &msg) {
         err = verifySupportForProfileAndLevel(profile, level);
 
         if (err != OK) {
+            ALOGE("%s does not support profile %x @ level %x",
+                    mComponentName.c_str(), profile, level);
             return err;
         }
 
         h264type.eProfile = static_cast<OMX_VIDEO_AVCPROFILETYPE>(profile);
         h264type.eLevel = static_cast<OMX_VIDEO_AVCLEVELTYPE>(level);
-    } else {
+    } 
+#if 0
+      else {
         // Use baseline profile for AVC recording if profile is not specified.
         h264type.eProfile = OMX_VIDEO_AVCProfileBaseline;
     }
+#endif
 
     ALOGI("setupAVCEncoderParameters with [profile: %s] [level: %s]",
             asString(h264type.eProfile), asString(h264type.eLevel));
@@ -4127,6 +4261,7 @@ status_t ACodec::setupAVCEncoderParameters(const sp<AMessage> &msg) {
         h264type.nCabacInitIdc = 1;
     }
 
+    setBFrames(&h264type, iFrameInterval, frameRate);
     if (h264type.nBFrames != 0) {
         h264type.nAllowedPictureTypes |= OMX_VIDEO_PictureTypeB;
     }
@@ -4166,6 +4301,8 @@ status_t ACodec::setupHEVCEncoderParameters(const sp<AMessage> &msg) {
         }
         frameRate = (float)tmp;
     }
+
+    AVUtils::get()->setIntraPeriod(setPFramesSpacing(iFrameInterval, frameRate), 0, mOMX, mNode);
 
     OMX_VIDEO_PARAM_HEVCTYPE hevcType;
     InitOMXParams(&hevcType);
@@ -4910,6 +5047,9 @@ status_t ACodec::getPortFormat(OMX_U32 portIndex, sp<AMessage> &notify) {
                     } else if (params.eNumData == OMX_NumericalDataFloat
                             && params.nBitPerSample == 32u) {
                         encoding = kAudioEncodingPcmFloat;
+                    } else if (params.eNumData == OMX_NumericalDataSigned
+                            && params.nBitPerSample == 24u) {
+                        encoding = kAudioEncodingPcm24bitPacked;
                     } else if (params.nBitPerSample != 16u
                             || params.eNumData != OMX_NumericalDataSigned) {
                         ALOGE("unsupported PCM port: %s(%d), %s(%d) mode ",
@@ -5200,7 +5340,7 @@ void ACodec::onOutputFormatChanged(sp<const AMessage> expectedFormat) {
         AudioEncoding pcmEncoding = kAudioEncodingPcm16bit;
         (void)mConfigFormat->findInt32("pcm-encoding", (int32_t*)&pcmEncoding);
         AudioEncoding codecPcmEncoding = kAudioEncodingPcm16bit;
-        (void)mOutputFormat->findInt32("pcm-encoding", (int32_t*)&pcmEncoding);
+        (void)mOutputFormat->findInt32("pcm-encoding", (int32_t*)&codecPcmEncoding);
 
         mConverter[kPortIndexOutput] = AudioConverter::Create(codecPcmEncoding, pcmEncoding);
         if (mConverter[kPortIndexOutput] != NULL) {
@@ -5249,8 +5389,10 @@ void ACodec::sendFormatChange() {
     }
 
     sp<AMessage> notify = mNotify->dup();
+    getVQZIPInfo(mOutputFormat);
     notify->setInt32("what", kWhatOutputFormatChanged);
     notify->setMessage("format", mOutputFormat);
+
     notify->post();
 
     // mLastOutputFormat is not used when tunneled; doing this just to stay consistent
@@ -5411,6 +5553,7 @@ bool ACodec::BaseState::onMessageReceived(const sp<AMessage> &msg) {
             ALOGI("[%s] forcing the release of codec",
                     mCodec->mComponentName.c_str());
             status_t err = mCodec->mOMX->freeNode(mCodec->mNode);
+            mCodec->changeState(mCodec->mUninitializedState);
             ALOGE_IF("[%s] failed to release codec instance: err=%d",
                        mCodec->mComponentName.c_str(), err);
             sp<AMessage> notify = mCodec->mNotify->dup();
@@ -6067,6 +6210,7 @@ bool ACodec::BaseState::onOMXFillBufferDone(
                 mCodec->mSkipCutBuffer->submit(info->mData);
             }
             info->mData->meta()->setInt64("timeUs", timeUs);
+            info->mData->meta()->setObject("graphic-buffer", info->mGraphicBuffer);
 
             sp<AMessage> notify = mCodec->mNotify->dup();
             notify->setInt32("what", CodecBase::kWhatDrainThisBuffer);
@@ -6372,6 +6516,14 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         if (list != NULL && list->findCodecByName(componentName.c_str()) >= 0) {
             matchingCodecs.add(componentName);
         }
+        //make sure if the component name contains qcom/qti, we add it to matchingCodecs
+        //as these components are not present in media_codecs.xml and MediaCodecList won't find
+        //these component by findCodecByName
+        if (matchingCodecs.size() == 0 && (componentName.find("qcom", 0) > 0 ||
+            componentName.find("qti", 0) > 0)) {
+            matchingCodecs.add(componentName);
+        }
+
     } else {
         CHECK(msg->findString("mime", &mime));
 
@@ -6594,6 +6746,7 @@ bool ACodec::LoadedState::onConfigureComponent(
     {
         sp<AMessage> notify = mCodec->mNotify->dup();
         notify->setInt32("what", CodecBase::kWhatComponentConfigured);
+        notify->setString("componentName", mCodec->mComponentName.c_str());
         notify->setMessage("input-format", mCodec->mInputFormat);
         notify->setMessage("output-format", mCodec->mOutputFormat);
         notify->post();
@@ -7301,6 +7454,18 @@ status_t ACodec::setParameters(const sp<AMessage> &params) {
         }
     }
 
+    int32_t numLayers = 0,
+            numBLayers = 0;
+    if (params->findInt32("num-temporal-layers", &numLayers)) {
+        params->findInt32("num-temporal-b-layers", &numBLayers);
+        status_t err = configureTemporalLayers(numLayers, numBLayers, false, mOutputFormat);
+        if (err != OK) {
+            ALOGE("Dynamic configuration of temporal layers (P=%d B=%d) failed: %d",
+                    numLayers, numBLayers, err);
+            err = OK;
+        }
+    }
+
     return OK;
 }
 
@@ -7313,6 +7478,13 @@ void ACodec::onSignalEndOfInputStream() {
         notify->setInt32("err", err);
     }
     notify->post();
+}
+
+sp<IOMXObserver> ACodec::createObserver() {
+    sp<CodecObserver> observer = new CodecObserver;
+    sp<AMessage> notify = new AMessage(kWhatOMXMessageList, this);
+    observer->setNotificationMessage(notify);
+    return observer;
 }
 
 bool ACodec::ExecutingState::onOMXFrameRendered(int64_t mediaTimeUs, nsecs_t systemNano) {
@@ -7381,8 +7553,34 @@ bool ACodec::OutputPortSettingsChangedState::onMessageReceived(
     bool handled = false;
 
     switch (msg->what()) {
-        case kWhatFlush:
         case kWhatShutdown:
+        {
+            int32_t keepComponentAllocated;
+            CHECK(msg->findInt32(
+                        "keepComponentAllocated", &keepComponentAllocated));
+
+            mCodec->mShutdownInProgress = true;
+            mCodec->mExplicitShutdown = true;
+            mCodec->mKeepComponentAllocated = keepComponentAllocated;
+
+            status_t err = mCodec->mOMX->sendCommand(
+                    mCodec->mNode, OMX_CommandStateSet, OMX_StateIdle);
+            if (err != OK) {
+                if (keepComponentAllocated) {
+                    mCodec->signalError(OMX_ErrorUndefined, FAILED_TRANSACTION);
+                }
+                // TODO: do some recovery here.
+            } else {
+                // This is technically not correct, but appears to be
+                // the only way to free the component instance using
+                // ExectingToIdleState.
+                mCodec->changeState(mCodec->mExecutingToIdleState);
+            }
+
+            handled = true;
+            break;
+        }
+        case kWhatFlush:
         case kWhatResume:
         case kWhatSetParameters:
         {
@@ -7441,6 +7639,11 @@ bool ACodec::OutputPortSettingsChangedState::onOMXEvent(
                             mCodec->mNode, OMX_CommandPortEnable, kPortIndexOutput);
                 }
 
+                /* Clear the RenderQueue in which queued GraphicBuffers hold the
+                 * actual buffer references in order to free them early.
+                 */
+                mCodec->mRenderTracker.clear(systemTime(CLOCK_MONOTONIC));
+
                 if (err == OK) {
                     err = mCodec->allocateBuffersOnPort(kPortIndexOutput);
                     ALOGE_IF(err != OK, "Failed to allocate output port buffers after port "
@@ -7449,15 +7652,6 @@ bool ACodec::OutputPortSettingsChangedState::onOMXEvent(
 
                 if (err != OK) {
                     mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
-
-                    // This is technically not correct, but appears to be
-                    // the only way to free the component instance.
-                    // Controlled transitioning from excecuting->idle
-                    // and idle->loaded seem impossible probably because
-                    // the output port never finishes re-enabling.
-                    mCodec->mShutdownInProgress = true;
-                    mCodec->mKeepComponentAllocated = false;
-                    mCodec->changeState(mCodec->mLoadedState);
                 }
 
                 return true;
