@@ -60,9 +60,11 @@ LOCAL_SRC_FILES:=                         \
         VBRISeeker.cpp                    \
         VideoFrameScheduler.cpp           \
         WAVExtractor.cpp                  \
+        WAVEWriter.cpp                    \
         WVMExtractor.cpp                  \
         XINGSeeker.cpp                    \
         avc_utils.cpp                     \
+        FFMPEGSoftCodec.cpp               \
 
 LOCAL_C_INCLUDES:= \
         $(TOP)/frameworks/av/include/media/ \
@@ -104,6 +106,10 @@ LOCAL_SHARED_LIBRARIES := \
         libz \
         libpowermanager \
 
+ifeq ($(BOARD_CANT_REALLOCATE_OMX_BUFFERS),true)
+LOCAL_CFLAGS += -DBOARD_CANT_REALLOCATE_OMX_BUFFERS
+endif
+
 LOCAL_STATIC_LIBRARIES := \
         libstagefright_color_conversion \
         libstagefright_aacenc \
@@ -129,6 +135,8 @@ LOCAL_SHARED_LIBRARIES += \
 
 LOCAL_CFLAGS += -Wno-multichar -Werror -Wno-error=deprecated-declarations -Wall
 
+LOCAL_C_INCLUDES += $(call project-path-for,qcom-media)/mm-core/inc
+
 # enable experiments only in userdebug and eng builds
 ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
 LOCAL_CFLAGS += -DENABLE_STAGEFRIGHT_EXPERIMENTS
@@ -142,6 +150,20 @@ endif
 
 LOCAL_CLANG := true
 LOCAL_SANITIZE := unsigned-integer-overflow signed-integer-overflow
+
+# FFMPEG plugin
+LOCAL_C_INCLUDES += $(TOP)/external/stagefright-plugins/include
+
+#LOCAL_CFLAGS += -DLOG_NDEBUG=0
+
+ifeq ($(BOARD_USE_SAMSUNG_COLORFORMAT), true)
+LOCAL_CFLAGS += -DUSE_SAMSUNG_COLORFORMAT
+
+# Include native color format header path
+LOCAL_C_INCLUDES += \
+	$(TOP)/hardware/samsung/exynos4/hal/include \
+	$(TOP)/hardware/samsung/exynos4/include
+endif
 
 LOCAL_MODULE:= libstagefright
 
