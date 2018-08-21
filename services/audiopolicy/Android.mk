@@ -50,6 +50,10 @@ LOCAL_SHARED_LIBRARIES := \
     liblog \
     libsoundtrigger
 
+ifeq ($(strip $(AUDIO_FEATURE_ENABLED_FM_POWER_OPT)),true)
+LOCAL_CFLAGS += -DFM_POWER_OPT
+endif
+
 ifeq ($(USE_CONFIGURABLE_AUDIO_POLICY), 1)
 
 ifneq ($(USE_XML_AUDIO_POLICY_CONF), 1)

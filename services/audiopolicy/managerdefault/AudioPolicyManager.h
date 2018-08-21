@@ -598,7 +598,10 @@ protected:
         bool mMasterMono;               // true if we wish to force all outputs to mono
         AudioPolicyMixCollection mPolicyMixes; // list of registered mixes
         audio_io_handle_t mMusicEffectOutput;     // output selected for music effects
-
+#ifdef FM_POWER_OPT
+        float mPrevFMVolumeDb;
+        bool mFMIsActive;
+#endif
         uint32_t nextAudioPortGeneration();
 
         // Audio Policy Engine Interface.
